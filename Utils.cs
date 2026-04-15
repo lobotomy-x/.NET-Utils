@@ -8,67 +8,120 @@ using System.Linq;
 using System.Management;
 using System.Net.Http;
 using System.Runtime.InteropServices;
-using System.Security.Policy;
 using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 
 /*
     Copyright lobotomyx 2026
     This file and all code within falls under MIT License and is free to use, modify, distribute, etc. under those terms. 
-
-    This has been made while working on the UEVR Frontend project and should all be generalizable enough to be useful in many applications.
-    
-    I think nuget is evil and terrible and most nuget packages are overengineered and generally just not worth using to do simple tasks
-    and aside from that I didn't want to force a dependency in a project that is not my own. That said you do need System.Management
-    for WMI unless you remove those portions so regrettably nuget must be used for that (and possibly a few of the other dotnet things)
-
-    I also cannot stand the habit every C# programmer seems to have of just making a new file for every single class, even tiny data structures,
-    and conversely I think one of the best parts of C# is the ability to put an entire namespace in a single file.
-    Therefore this is an atypical C# package that exists solely as this one file and can be copied and pasted into any dotnet project.
-
-    Everything here has been tested on both dotnet 6 and dotnet 10
-
-    You probably want to change the namespace name to your own app name, e.g. UEVR.Utils
-    Then you can write `using Utils;` and call any of the class methods.
-    But my recommendation would be to just write `using static Utils.ClassName;` e.g. `using static Utils.ShortcutHelper;` 
-    This will allow you to directly call the class methods in your program.
 */
 
 // Static Helper Classes
-namespace Utils
- {
-    // may need to expand the data you check
+namespace Utils {
+    // very little UEVR specific info here, could easily be adapted to fit other projects
+    // For usage see https://github.com/lobotomy-x/uevr-frontend/blob/main/UEVR/Updater.cs and https://github.com/lobotomy-x/uevr-frontend/blob/main/UEVR/MainWindowSettingsMenu.xaml.cs
+    
+    
     public static class GitAPI {
         #region serialize
-        public class Asset
-        {
+        public class Asset {
             public string? Name { get; set; }
             public string? Browser_Download_Url { get; set; }
         }
 
-        public class GitHubResponseObject
-        {
+        public class GitHubResponseObject {
             public string? Tag_Name { get; set; }
             public List<Asset>? Assets { get; set; }
-        }
-        #endregion
 
-        // avoids remaking a client but splits the check + download into two tasks
-        public sealed class UpdateClient : IAsyncDisposable
-        {
-            public HttpClient Client { get; } = new HttpClient
-            {
+            public DateTime? Published_At { get; set; }
+            public DateTime? Created_At { get; set; }
+            public string? Name { get; set; }
+            public long Id { get; set; }
+        }
+
+
+        #endregion
+        public static async Task<List<GitHubResponseObject>> GetAllReleasesAsync(
+    HttpClient client, string agentName, string repoReleasesUrl) {
+            client.DefaultRequestHeaders.UserAgent.ParseAdd(agentName);
+
+            string response = await client.GetStringAsync(repoReleasesUrl);
+            if (string.IsNullOrEmpty(response))
+                return new List<GitHubResponseObject>();
+
+            return JsonSerializer.Deserialize<List<GitHubResponseObject>>(
+                response,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
+            ) ?? new List<GitHubResponseObject>();
+        }
+
+        public static GitHubResponseObject? GetResponseByDisplayName(UpdateClient client, string displayName) {
+
+            DateTime displayDateTime = DateTime.Parse(displayName);
+            foreach (var release in client.ReleaseList) {
+                if (release is null) continue;
+                if (release.Published_At == displayDateTime) {
+                    return release;
+                }
+            }
+            return client.ReleaseList.First();
+        }
+
+
+        public static async Task<bool> CheckForUpdate(UpdateClient session, string revision) {
+            session.Client.DefaultRequestHeaders.UserAgent.ParseAdd("UEVR");
+            var getAll = GetAllReleasesAsync(session.Client, "UEVR", "https://api.github.com/repos/praydog/uevr-nightly/releases");
+            await getAll;
+            session.ReleaseList = getAll.Result;
+            var latestVersion = session.ReleaseList.OrderByDescending(r => r.Published_At).First();
+            session.Latest = (GitHubResponseObject)latestVersion;
+            foreach (var release in session.ReleaseList) {
+                if (release is null) continue;
+                if (release.Tag_Name.Contains(revision)) {
+                    var dt = (DateTime)release.Published_At;
+                    if (dt.CompareTo((DateTime)latestVersion.Published_At) < 0) {
+                        return true;
+                    }
+                }
+            }
+            session.DisposeAsync();
+            return false;
+        }
+
+
+        public static List<string> BuildVersionList(List<GitHubResponseObject> releaseObjects) {
+            List<string> releases = new List<string>();
+            try {
+
+                releaseObjects = releaseObjects.OrderByDescending(r => r.Published_At).ToList();
+                foreach (var obj in releaseObjects) {
+                    if (obj is null) continue;
+                    releases.Add(obj.Published_At.ToString());
+                }
+            } catch { }
+            return releases;
+        }
+
+
+        // avoids remaking a client
+        public sealed class UpdateClient : IAsyncDisposable {
+            public HttpClient Client { get; } = new HttpClient {
                 Timeout = TimeSpan.FromSeconds(30)
             };
 
             public string? DownloadUrl { get; set; }
             public string? TagName { get; set; }
+            public GitHubResponseObject? Latest { get; set; }
 
-            public ValueTask DisposeAsync()
-            {
+
+
+            public List<GitHubResponseObject> ReleaseList { get; set; }
+
+            public ValueTask DisposeAsync() {
                 Client.Dispose();
                 return ValueTask.CompletedTask;
             }
@@ -76,8 +129,7 @@ namespace Utils
 
         // compares our local revision to the latest nightly and returns to the parent task
         // two steps because we need to ask users without autoupdate enabled if they want the update
-        public static async Task<bool> CheckForUpdateAsync(UpdateClient session, string agentName, string repoUrl, string localRevision)
-        {
+        public static async Task<bool> CheckForUpdateAsync(UpdateClient session, string agentName, string repoUrl, DateTime? lastUpdate) {
             session.Client.DefaultRequestHeaders.UserAgent.ParseAdd(agentName);
 
             string response = await session.Client.GetStringAsync(repoUrl);
@@ -88,9 +140,9 @@ namespace Utils
                 response,
                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
 
-            string? tag = release?.Tag_Name;
-            if (tag is not null && tag.EndsWith(localRevision, StringComparison.OrdinalIgnoreCase))
+            if (lastUpdate is not null && ((DateTime)lastUpdate).CompareTo(release.Published_At) >= 0) {
                 return false;
+            }
 
             var asset = release?.Assets?
                 .FirstOrDefault(a => a.Name?.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) == true);
@@ -99,14 +151,17 @@ namespace Utils
                 return false;
 
             session.DownloadUrl = asset.Browser_Download_Url;
-            session.TagName = tag;
 
             return true;
         }
 
-        // main window will handle the next steps (usage in readme for separate github post)
-        public static async Task<bool> DownloadUpdateAsync(UpdateClient session, string downloadPath)
-        {
+
+
+
+
+        // mainwindow will handle the next steps
+        // the caller must ensure the path is safe to write to e.g. with Path.TempFile
+        public static async Task<bool> DownloadUpdateAsync(UpdateClient session, string downloadPath) {
             if (session.DownloadUrl is null)
                 return false;
 
@@ -116,32 +171,52 @@ namespace Utils
 
             if (!resp.IsSuccessStatusCode)
                 return false;
+            try {
+                await using var fs = new FileStream(
+                    downloadPath,
+                    FileMode.Create,
+                    FileAccess.Write,
+                    FileShare.None,
+                    81920,
+                    useAsync: true);
 
-            await using var fs = new FileStream(
-                downloadPath,
-                FileMode.Create,
-                FileAccess.Write,
-                FileShare.None,
-                81920,
-                useAsync: true);
+                await resp.Content.CopyToAsync(fs);
+            } catch {
 
-            await resp.Content.CopyToAsync(fs);
+            }
             return true;
         }
 
-        
-        public static async Task RunUpdateTasks(string url, string revision, string userAgentName, string downloadPath, bool automaticUpdates, Task<bool>? allowSingleUpdate)
-        {
+        public static async Task DownloadSpecificRelease(GitHubResponseObject? Release, string downloadPath) {
             await using var session = new UpdateClient();
+            if (Release is not null) {
+                var asset = Release?.Assets?
+            .FirstOrDefault(a => a.Name?.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) == true);
 
-            bool updateAvailable = await CheckForUpdateAsync(session, userAgentName, url, revision);
+
+                session.DownloadUrl = asset.Browser_Download_Url;
+                session.TagName = Release.Tag_Name;
+
+
+
+                await DownloadUpdateAsync(session, downloadPath);
+            }
+
+
+
+
+
+        }
+
+
+        public static async Task RunUpdateTasks(UpdateClient session, string url, DateTime? lastUpdate, string userAgentName, string downloadPath, bool automaticUpdates, Task<bool>? allowSingleUpdate) {
+
+            bool updateAvailable = await CheckForUpdateAsync(session, userAgentName, url, lastUpdate);
             if (!updateAvailable)
                 return;
 
-            if (!automaticUpdates)
-            {
-                if (allowSingleUpdate is not null)
-                {
+            if (!automaticUpdates) {
+                if (allowSingleUpdate is not null) {
                     var result = await allowSingleUpdate;
                     if (!result) return;
                 }
@@ -149,94 +224,55 @@ namespace Utils
 
             await DownloadUpdateAsync(session, downloadPath);
         }
-
-
-  /*
-
-  Usage Snippet: 
-     string revision = "";
-     try
-     {
-         if (File.Exists(revision_path))
-             revision = File.ReadAllText(revision_path);
-     }
-     catch (Exception)
-     {
-         revision = "";
-     }
-  
-     var downloadPath = Path.Combine(GetGlobalDir(), "UEVR", "nightly.zip");
-     var url = "https://api.github.com/repos/praydog/uevr-nightly/releases/latest";
-     try
-     {             
-      var updater = RunUpdateTasks(url, revision, "UEVR", downloadPath, canAutoUpdate, canUpdateOnce);
-      
-       if (!updater.IsCompletedSuccessfully)
-       {
-           return;
-       }
-     
-       var nightlyDir = Path.Combine(GetGlobalDir(), "UEVR", "Nightly");
-       if (!Directory.Exists(nightlyDir)) Directory.CreateDirectory(nightlyDir);
-
-       ZipFile.ExtractToDirectory(downloadPath, nightlyDir, true);
-      
-      */
-            
     }
 
-    // idk if there's a more tried and true design pattern for dotnet but I think most dotnet design patterns are bad so idc either
-    // I don't think these really need explanation and they do undeniably save you a few lines of code 
-    //  unless you're just not checking nulls
-    public static class Nullables
-    {
-        // the only possible oddity to mention here is that I'm expecting identical types
-        // which means if you have e.g. a string? and a string you need to cast the non-nullable to nullable 
-        public static bool NullableEquals(object? nullable, object? other)
-        {
+
+    public static class Nullables {
+        public static bool NullableEquals(object? nullable, object? other) {
             if (nullable is null) return false;
             if (other is null) return false;
             if (other.GetType() != nullable.GetType()) return false;
             return nullable == other;
         }
-        // might add a container version later
-        public static bool NullableContains(string? nullable, string? other)
-        {
+        public static bool NullableContains(string? nullable, string? other) {
             if (nullable is null) return false;
             if (other is null) return false;
             if (other.Length == 0) return false;
-            return nullable.Contains(other);
+            return nullable.Contains(other, StringComparison.InvariantCultureIgnoreCase);
+        }
+        public static bool Contains(List<string>? list, string? term) {
+            if (list is null) return false;
+            if (term is null) return false;
+            if (list.Count == 0) return false;
+            foreach (var s in list) {
+                if (NullableContains(s, term)) {
+                    return true;
+                }
+            }
+            return false;
         }
     }
 
     // UAC must be enabled to launch processes without elevation
-    // Most people have it enabled and don't need this
-    // if anything you can just adapt this into a generic registry key checker
-    public static class UacHelper
-    {
+    // in that case the user would be running UEVR as admin as well which might be okay 
+    // Not currently using
+    public static class UacHelper {
         // Registry key path for UAC settings
         private const string UacRegistryKeyPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
         private const string EnableLUAValueName = "EnableLUA";
-        public static bool IsUacEnabled()
-        {
-            try
-            {
-                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(UacRegistryKeyPath))
-                {
-                    if (key != null)
-                    {
+        public static bool IsUacEnabled() {
+            try {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(UacRegistryKeyPath)) {
+                    if (key != null) {
                         object enableLUAValue = key.GetValue(EnableLUAValueName);
 
-                        if (enableLUAValue != null && enableLUAValue is int)
-                        {
+                        if (enableLUAValue != null && enableLUAValue is int) {
                             // UAC is enabled if the value is non-zero (typically 1).
                             return (int)enableLUAValue != 0;
                         }
                     }
                 }
-            }
-            catch (Exception ex)
-            {
+            } catch (Exception ex) {
                 // if we failed to read it then we probably are running as a user with low perms so we'll assume its on
                 return false;
             }
@@ -245,19 +281,68 @@ namespace Utils
         }
     }
 
+    // Opening a webpage in the user's default browser should be easy, just use new ProcessStartInfo(url){UseShellExecute=true}, right?
+    // Well yes, but actually no. Chrome is the most popular browser by far and chrome has a funny little quirk
+    // Directly opening a url in chrome from commandline totally works, but not if the program is already running under the same windows user profile
+    // To address this we will use the registry to get the user's default browser and use the correct command line if the browser is chrome
+     
+    public static class BrowserHelper {
+       
+        public static string GetDefaultBrowserPath() {
+            const string userChoicePath = @"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice";
+
+            using (RegistryKey userChoiceKey = Registry.CurrentUser.OpenSubKey(userChoicePath)) {
+                if (userChoiceKey == null) return "Edge (Fallback)";
+
+                // Get the ProgId (e.g., "ChromeHTML")
+                object progIdValue = userChoiceKey.GetValue("ProgId");
+                if (progIdValue == null) return "Edge (Fallback)";
+
+                string progId = progIdValue.ToString();
+
+                // Now find the command for this ProgId
+                using (RegistryKey commandKey = Registry.ClassesRoot.OpenSubKey($@"{progId}\shell\open\command")) {
+                    if (commandKey == null) return null;
+
+                    // Returns something like: "C:\...\chrome.exe" -- "%1"
+                    string command = commandKey.GetValue(null)?.ToString();
+                    return command?.Split('"') [1]; // Extract just the EXE path
+                }
+            }
+        }
+
+        
+        public static void LaunchURL(string? url) {
+            try {
+                url = url!.Replace("&", "^&");
+                var p = Process.Start(new ProcessStartInfo(url) {
+                    UseShellExecute = true,
+                    CreateNoWindow = true,
+                    LoadUserProfile = true
+                });
+                if (p is null) {
+                    var browser = GetDefaultBrowserPath();
+                    if (browser.EndsWith("chrome.exe", StringComparison.InvariantCultureIgnoreCase)) {
+                        Process.Start(new ProcessStartInfo() {
+                            FileName = browser,
+                            Arguments = $"--new-window \"{url}\"",
+                        });
+                    }
+                }
+            } catch { }
+        }
+    }
     /*
-        There's a weird void of real knowledge about shortcuts in Windows so this is kind of the juicy one.
-        If you search for how to make one almost all info points towards using ancient WScript stuff from powershell
+        There's a weird void of real knowledge about shortcuts
+        If you search for how to make one almost all info points 
+        towards using ancient WScript stuff from powershell
         Or encourages you to add a COM reference to your project
         Or even worse add a big nuget package to be able to work with the lnk binary format
-        But you can literally just pinvoke the actual winapi stuff like anything else in Windows
-        These felt odd to bury in a xaml.cs class which led me to bother making this 
-        I'll confess the one thing I do vibe code is the pinvoke bindings
-        But even then I really had to find the relevant winapi functions myself and directly ask for pinvoke bindings
-        otherwise I kept being told to use the aforementioned methods
+        But you can literally just pinvoke the actual winapi stuff like anything else in windows
+        This is used exclusively by the settings menu but felt odd to bury inside a xaml.cs class
     */
-    public static class ShortcutHelper
-    {
+    public static class ShortcutHelper {
+
         [ComImport]
         [Guid("00021401-0000-0000-C000-000000000046")]
         public class ShellLink { }
@@ -265,9 +350,8 @@ namespace Utils
         [ComImport]
         [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         [Guid("000214F9-0000-0000-C000-000000000046")]
-        public interface IShellLinkW
-        {
-            void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszFile, int cchMaxPath, out IntPtr pfd, int fFlags);
+        private interface IShellLinkW {
+            void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszFile, int cchMaxPath, IntPtr pfd, int fFlags);
             void GetIDList(out IntPtr ppidl);
             void SetIDList(IntPtr pidl);
             void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszName, int cchMaxName);
@@ -287,11 +371,11 @@ namespace Utils
             void SetPath([MarshalAs(UnmanagedType.LPWStr)] string pszFile);
         }
 
+
         [ComImport]
         [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         [Guid("0000010B-0000-0000-C000-000000000046")]
-        public interface IPersistFile
-        {
+        private interface IPersistFile {
             void GetClassID(out Guid pClassID);
             void IsDirty();
             void Load([MarshalAs(UnmanagedType.LPWStr)] string pszFileName, int dwMode);
@@ -300,16 +384,15 @@ namespace Utils
             void GetCurFile([MarshalAs(UnmanagedType.LPWStr)] out string ppszFileName);
         }
 
+
         // Lame and stupid method using powershell (still better than actually using COM in C#)
-        public static void CreateShortcutPS(string shortcutPath, string targetFileLocation)
-        {
+        public static void CreateShortcutPS(string shortcutPath, string targetFileLocation) {
             var cmd = "-Command \"$s=(New-Object -COM WScript.Shell).CreateShortcut(" +
                 $"'{shortcutPath}');" +
                 "$s.TargetPath=" +
                $"'{targetFileLocation}';" +
                "$s.IconLocation = $s.TargetPath + ', 0';$s.Save()\"";
-            ProcessStartInfo startInfo = new ProcessStartInfo()
-            {
+            ProcessStartInfo startInfo = new ProcessStartInfo() {
                 FileName = "powershell.exe",
                 Arguments = cmd,
                 UseShellExecute = false,
@@ -319,9 +402,26 @@ namespace Utils
             Process.Start(startInfo);
         }
 
-        // only the destination (.lnk) and target (.exe) are required
-        public static void CreateShortcutNative(string shortcutPath, string target, string? args = null, string? iconPath = null, int? windowStyle = null)
-        {
+        public static string? GetShortcutTarget(string shortcutPath) {
+            var link = (IShellLinkW)new ShellLink();
+            ((IPersistFile)link).Load(shortcutPath, 0);
+
+            var sb = new StringBuilder(260);
+            link.GetPath(sb, sb.Capacity, IntPtr.Zero, 0);
+            return sb.ToString();
+        }
+
+        public static string? GetShortcutArguments(string shortcutPath) {
+            var link = (IShellLinkW)new ShellLink();
+            ((IPersistFile)link).Load(shortcutPath, 0);
+
+            var sb = new StringBuilder(260);
+            link.GetArguments(sb, sb.Capacity);
+            return sb.ToString();
+        }
+
+
+        public static void CreateShortcutNative(string shortcutPath, string target, string? args = null, string? iconPath = null, int? windowStyle = null) {
             var link = (IShellLinkW)new ShellLink();
             link.SetPath(target);
             if (args is not null) link.SetArguments(args);
@@ -331,39 +431,53 @@ namespace Utils
             persist.Save(shortcutPath, true);
         }
 
-        // Used in UEVR to create startup shortcuts for EGS and Steam to keep them from unnecessarily elevating
-        // Which has the effect of carrying over to games, also very unnecessary
-        // Games that truly need to elevate, e.g. to run an anticheat service, can still do so by asking permission
-        // And the launchers can ask for privileges to install stuff and can have their background services running
-        // So this doesn't do anything weird or concerning, rather it stops those programs from doing weird, concerning things
-        // With this setup you basically never need to run as admin to inject into viable games which is ideal
-        // Even if your app has nothing to do with injecting into games this can be very useful to have available
-        public static void CreateUnelevatedShortcut(string targetFileLocation, string directory)
-        {
-            var shortcutPath = Path.Combine(directory, Path.GetFileNameWithoutExtension(targetFileLocation) + ".lnk");
+        /*      
+                 Used in UEVR frontend to create startup shortcuts for EGS and Steam to keep them from unnecessarily elevating
+                 Which has the effect of carrying over to games, also very unnecessary
+                 Games that truly need to elevate, e.g. to run an anticheat service, can still do so by asking permission
+                 launchers can ask for privileges to install games and can have their background services running
+                 So this doesn't do anything weird or concerning
+                 rather it stops those programs from doing weird, concerning things
+                 With this setup you basically never need to run as admin which is ideal.
+
+                 Note that because this is actually making a shortcut to cmd rather than the intended targets
+                 the actual link has to be retrieved with GetShortcutArguments
+
+                     var steamArgs = GetShortcutArguments(_SteamLnkPath);
+                     var _SteamTargetPath = Path.GetFullPath(steamArgs.Split(" ").Last());
+                  
+                it is possible to directly launch processes with environment args in C# so it may
+                also be possible from a shortcut. Direct launch isn't an option since we need to intercept normal startup with windows
+                Compat Layer options are not really well exposed or documented in windows
+
+        */
+
+        public static void CreateUnelevatedShortcut(string targetFileLocation, string shortcutPath) {
             CreateShortcutNative(
                 shortcutPath,
                 "cmd.exe",
                 // launch minimized cmd window and set the env var for the session
                 // this env var makes it so processes will not automatically try to elevate
-                // of course if you run the shortcut as admin it will run as admin
-                // this also does not work whatsoever if UAC is fully disabled and the user is an admin
+                // this only works if the user has UAC enabled which most should
+                // but disabling it to run all games as admin does improve performance so its more common than one might think
                 "/min /C " + "\"set __COMPAT_LAYER=RUNASINVOKER && start \"\" \"" + targetFileLocation + "\"",
                 targetFileLocation,
                 7
             );
         }
 
-        // You can just use File.Delete in all likelihood, this isn't necessary for COM stuff
-        // its just another option if you have trouble deleting
-        public static void DeleteShortcut(string shortcutPath)
-        {
+        public static void DeleteShortcut(string shortcutPath) {
+            try {
+                File.Delete(shortcutPath);
+                if (!File.Exists(shortcutPath))
+                    return;
+            } catch { }
+
             var cmd = "-Command \"Remove-Item -Path \"" +
                 $"{shortcutPath}" +
                 "\" -Force";
 
-            ProcessStartInfo startInfo = new ProcessStartInfo()
-            {
+            ProcessStartInfo startInfo = new() {
                 FileName = "powershell.exe",
                 Arguments = cmd,
                 UseShellExecute = false,
@@ -373,89 +487,98 @@ namespace Utils
             Process.Start(startInfo);
         }
 
-        // I'm only making bindings for the things I actually need but you can easily modify these two methods
-        // to work with anything in the IShellLinkW interface
-        public static void UpdateShortcutTarget(string shortcutPath, string newTargetPath)
-        {
+        public static void UpdateShortcutTarget(string shortcutPath, string? newTargetPath) {
+            if (newTargetPath is null) return;
             var link = (IShellLinkW)new ShellLink();
             ((IPersistFile)link).Load(shortcutPath, 0);
             link.SetPath(newTargetPath);
             ((IPersistFile)link).Save(shortcutPath, true);
         }
 
-        // get path to the exe from existing shortcut
-        public static string? GetShortcutTarget(string shortcutPath)
-        {
-            var link = (IShellLinkW)new ShellLink();
-            ((IPersistFile)link).Load(shortcutPath, 0);
 
-            var sb = new StringBuilder(260);
-            link.GetPath(sb, sb.Capacity, out _, 0);
-            return sb.ToString();
-        }
-
-        // Placing shortcuts here will run the process on startup
-        // This may require that you make an unelevated shortcut
-        public static string GetShellStartupPath(string? shortcutName)
-        {
-            var startup = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Microsoft", "Windows", "Start Menu", "Programs", "Startup");
-            if (!Directory.Exists(startup))
-            {
+        public static string GetShellStartupPath(string? shortcutName = null) {
+            var startup = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup));
+            if (!Directory.Exists(startup)) {
                 Directory.CreateDirectory(startup);
             }
             return shortcutName is null ? startup : Path.Combine(startup, shortcutName);
         }
+
     }
-    
-    public static class ProcessManagement
-    {
+
+    public static class ProcessManagement {
         /*
             Things we can do to elevated processes while unelevated
-             Some may not be true if there is kernel protection 
+             and to protected processes while elevated
                 - check if they're running
-                - get the pid
+                - get the pid, process name, and title
                 - check if they're responding
                 - get memory usage
                 - get lifetime info
+                - subscribe to events
                 - get mainwindow handle and title
                 - use mainwindow handle to get window class
                 - use wmi to get commandline and modules
                 - kill
+                - list threads
                 - pass the mainwindowhandle or pid to an elevated service to inject
+                  or in the case of protected processes, inject if early enough
+                - enable window hooks
+           Things we cannot do
+                - inject without a service
+                - enable raising events
+                - view modules
+                - list handle count
+                - suspend, resume, create threads
+                
         */
 
         [Flags]
-        public enum ProcessAccessFlags : uint
-        {
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x00001000,
-            SYNCHRONIZE = 0x00100000
-        }
+        public enum ProcessAccessFlags : uint {
+            TERMINATE = 0x0001,
+            SUSPEND_RESUME = 0x0800,
+            // can open elevated and protected processes and get minimal info
+            QUERY_LIMITED_INFORMATION = 0x1000,
+            ALL_ACCESS = 0x1FFFFF,
+        };
 
-        // Import necessary Kernel32 functions
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr OpenProcess(ProcessAccessFlags dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+        [DllImport("ntdll.dll")]
+        public static extern uint RtlAdjustPrivilege(uint Privilege, bool bEnablePrivilege, bool IsThreadPrivilege, out bool PreviousValue);
+
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool QueryFullProcessImageName(IntPtr hprocess, int dwFlags, StringBuilder lpExeName, out int size);
+        public static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
+        [DllImport("kernel32.dll")]
+        public static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern IntPtr OpenProcess(ProcessAccessFlags dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern bool QueryFullProcessImageName(IntPtr hprocess, int dwFlags, StringBuilder lpExeName, out int size);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr hHandle);
 
-        public static bool IsCurrentProcessElevated()
-        {
+        public static bool IsCurrentProcessElevated() {
             WindowsIdentity identity = WindowsIdentity.GetCurrent();
             WindowsPrincipal principal = new WindowsPrincipal(identity);
             return principal.IsInRole(WindowsBuiltInRole.Administrator);
         }
+        public static void LaunchProcessUnelevated(string procPath) {
+            if (IsProcessRunning(Path.GetFileNameWithoutExtension(procPath), out Process? p)) {
+                if (IsProcessElevated(p)) {
+                    try {
+                        TerminateProcessWMI((int?)p.Id);
+                    } catch { }
+                }
+            }
 
-        // tbh if you're making the process directly you could also just make bindings for CreateProcessAsUser
-        public static void LaunchProcessUnelevated(string procPath)
-        {
-            ProcessStartInfo startInfo = new ProcessStartInfo()
-            {
+            ProcessStartInfo startInfo = new ProcessStartInfo() {
                 FileName = "cmd.exe",
-                // sorry...
-                Arguments = @$"cmd /min /C ""set __COMPAT_LAYER=RUNASINVOKER && start """" ""{procPath}""""",
+                Arguments = @$"/min /C ""set __COMPAT_LAYER=RUNASINVOKER && start """" ""{procPath}""""",
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 LoadUserProfile = true
@@ -465,98 +588,116 @@ namespace Utils
 
         // More accurately this is checking if we can likely restart as an admin and get a handle
         // Meaning that it will return false if the process is dead or kernel protected
-        public static bool IsProcessElevated(Process? p)
-        {
-            if (p is null || p.HasExited) return false;
-            try
-            {
+        public static bool IsProcessElevated(Process? p) {
+            if (p is null) return false;
+            try {
+                if (p.HasExited) return false;
                 var handle = p.SafeHandle;
             }
             // Relying on an exception is not ideal but there's not many other ways to do this
             // probably the most reliable would be to have an elevated service that opens the process to get the token but that kind of defeats the purpose
-            catch(Win32Exception e)
-            {
-                if(e.Message.ToString() == "Access is denied")
-                {
-                    // if we are elevated
-                    if (!IsCurrentProcessElevated())
-                        return true;
-                    else // Kernel protected in all likelihood
-                        return false;
-                }
+            catch (Win32Exception e) {
+
+                // if we are elevated
+                if (!IsCurrentProcessElevated())
+                    return true;
+                else
+                    return false;
+            }
+
+            return false;
+        }
+        public static bool IsProcessRunning(Process? p) {
+            if (p is null) return false;
+            if (p.HasExited) return false;
+            return true;
+        }
+
+        public static bool IsProcessRunning(string name, out string? path) {
+            path = null;
+            foreach (var p in Process.GetProcessesByName(name)) {
+                if (p is null || p.HasExited) return false;
+                try {
+                    if (p.Responding) {
+                        return GetExecutablePath(p, out path);
+                    }
+                } catch { }
             }
             return false;
         }
 
-        // I'm not aware of any cases where this would fail to get a path with a running process
-        // maybe for some system procs
-        public static bool IsProcessRunning(string name, out string? path)
-        {
-            path = null;
-            foreach (var p in Process.GetProcessesByName(name))
-            {
+        public static bool IsProcessRunning(string name, out Process? proc) {
+            proc = null;
+            foreach (var p in Process.GetProcessesByName(name)) {
                 if (p is null || p.HasExited) return false;
-                try
-                {
-                    if (p.Responding)
-                    {
-                        return GetExecutablePath(p, out path);
+                try {
+                    if (p.Responding) {
+                        proc = p;
+                        return true;
                     }
-                    else {
-                      p.Kill();
-                      return false;
-                    }
-                }
-                catch  { }
+                } catch { }
             }
             return false;
+        }
+
+
+        public static bool IsProcessRunning(string name, out Process? proc, out string? path) {
+            proc = null;
+            path = null;
+            return IsProcessRunning(name, out path) && IsProcessRunning(name, out proc);
+        }
+
+        public static bool IsProcessRunning(int id) {
+            var proc = Process.GetProcessById(id);
+            if (proc is null)
+                return false;
+            else Console.WriteLine(proc.MainWindowTitle);
+            return true;
+        }
+
+        public static DateTime? GetProcessStartTime(int id) {
+            var proc = Process.GetProcessById(id);
+            if (proc is null)
+                return null;
+            return proc.StartTime;
         }
 
         // Pinvoke option for getting full path from elevated procs
-        public static bool GetExecutablePath(Process p, out string? path)
-        {
+        public static bool GetExecutablePath(Process p, out string? path) {
             path = null;
             int processId = p.Id;
-            if (IsCurrentProcessElevated())
-            {
-                try
-                {
+            if (IsCurrentProcessElevated()) {
+                try {
                     var mod = p.MainModule;
-                    if (mod is not null)
-                    {
+                    if (mod is not null) {
                         path = mod.FileName;
-                        if (path is not null) return true;
+                        if (path is not null)
+                            return true;
                     }
-                }
-                catch {}
-            }
-            else if (IsProcessElevated(p))  // This should basically only come up if its actually an issue of the other proc being elevated
-            {
+                } catch { }
+            } else if (IsProcessElevated(p))  // This should basically only come up if its actually an issue of the other proc being elevated
+              {
                 var buffer = new StringBuilder(1024);
                 // Query limited information flag was added alongside protected processes and should let us get bare minimum info for anything non-kernel
-                try
-                {
-                    IntPtr hProcess = OpenProcess(ProcessAccessFlags.PROCESS_QUERY_LIMITED_INFORMATION, false, processId);
+                try {
+                    IntPtr hProcess = OpenProcess(ProcessAccessFlags.QUERY_LIMITED_INFORMATION, false, (uint)processId);
                     if (hProcess == IntPtr.Zero) {
-                      return GetExecutablePath(processId, out path);
+                        // couldn't open a handle so we'll try WMI
+                        return GetExecutablePath(processId, out path);
                     }
                     int size = buffer.Capacity;
-                    if (QueryFullProcessImageName(hProcess, 0, buffer, out size))
-                    {
+                    if (QueryFullProcessImageName(hProcess, 0, buffer, out size)) {
                         path = buffer.ToString();
                         CloseHandle(hProcess);
                         return true;
-                    }
-                    else
-                    {
+                    } else {
                         CloseHandle(hProcess);
                         return GetExecutablePath(processId, out path);
                     }
-                }
-                catch {}
-            }
-            else if (p is not null && !p.HasExited) // If we ended up here its probably a protected process or has exited
-            {
+                } catch { }
+            } else if (p is not null && !p.HasExited) // If we ended up here its probably a protected process or has exited
+              {
+                // we'll try WMI in case its just protected
                 return GetExecutablePath(processId, out path);
             }
             return false;
@@ -565,122 +706,341 @@ namespace Utils
 
         // wmi fallback
         // This way we don't need an actual Process handle
-        public static bool GetExecutablePath(int pid, out string? path)
-        { 
+        public static bool GetExecutablePath(int pid, out string? path) {
             path = null;
             // Construct the WQL query
             string wqlQuery = $"SELECT ExecutablePath FROM Win32_Process WHERE ProcessId = {pid}";
 
-            try
-            {
+            try {
                 // Connect to WMI and execute the query
-                using (var searcher = new ManagementObjectSearcher(wqlQuery))
-                {
-                    foreach (ManagementObject process in searcher.Get())
-                    {
-                            path = process["ExecutablePath"]?.ToString();
+                using (var searcher = new ManagementObjectSearcher(wqlQuery)) {
+                    foreach (ManagementObject process in searcher.Get()) {
+                        // The CommandLine property contains the full command used to start the process
+                        path = process ["ExecutablePath"]?.ToString();
                         return true;
                     }
                 }
-            }
-            catch (Exception ex)
-            {
+            } catch (Exception ex) {
                 Console.WriteLine($"Error querying WMI: {ex.Message}");
             }
 
             return false;
         }
-        
-        // normally you can only get this if you monitored process creation
-        public static bool GetCommandLine(int pid, out string? commandLine)
-        { 
+
+        // this will get us protected and elevated names to show in the main window
+        // id will be obtained by scanning for unreal window
+        public static string GetExecutableName(int pid) {
+            try {
+                // Generally we should be able to get this, I've not seen a case where its impossible
+                // But it may depend on some windows setting or access rights
+                Process? p = Process.GetProcessById(pid);
+                if (p is not null)
+                    return p.ProcessName;
+            } catch (Exception ex) {
+            }
+            try {
+                string q = $"SELECT Name FROM Win32_Process WHERE ProcessId = {pid}";
+                using var searcher = new ManagementObjectSearcher(q);
+                foreach (ManagementObject obj in searcher.Get()) {
+                    return obj ["Name"]?.ToString() ?? "(null)";
+                }
+            } catch (Exception ex) {
+                return "WMI ERROR: " + ex.Message;
+            }
+            return "(not found)";
+        }
+
+        // normally you can only get this if you monitored process creation or use pinvoke
+        public static bool GetCommandLine(int pid, out string? commandLine) {
             commandLine = null;
             // Construct the WQL query
             string wqlQuery = $"SELECT CommandLine FROM Win32_Process WHERE ProcessId = {pid}";
 
-            try
-            {
+            try {
                 // Connect to WMI and execute the query
-                using (var searcher = new ManagementObjectSearcher(wqlQuery))
-                {
-                    foreach (ManagementObject process in searcher.Get())
-                    {
-                            commandLine = process["CommandLine"]?.ToString();
+                using (var searcher = new ManagementObjectSearcher(wqlQuery)) {
+                    foreach (ManagementObject process in searcher.Get()) {
+                        commandLine = process ["CommandLine"]?.ToString();
                         return true;
                     }
                 }
-            }
-            catch (Exception ex)
-            {
+            } catch (Exception ex) {
                 Console.WriteLine($"Error querying WMI: {ex.Message}");
             }
 
             return false;
         }
-       
 
-        /*
-        Win32_ModuleLoadTrace -Property *
+        public static bool TerminateProcessNative(int? pid) {
+            if (pid is not null) {
+                try {
+                    IntPtr hProcess = OpenProcess(ProcessAccessFlags.TERMINATE, false, (uint)pid);
+                    if (hProcess != IntPtr.Zero) {
+                        if (TerminateProcess(hProcess, 0)) {
+                            if (GetExitCodeProcess(hProcess, out uint exitCode)) {
+                                return true;
+                            }
+                        }
 
-        'DefaultBase','FileName','ImageBase','ImageChecksum','ImageSize','ProcessID',
-        'SECURITY_DESCRIPTOR','TIME_CREATED','TimeDateSTamp'
-        'Caption','CommandLine','CreationClassName','CreationDate','CSCreationClassName',
+                    }
+                } catch (Exception ex) {
 
-        Win32_Process -Property *
-
-        'CSName','Description','ExecutablePath','ExecutionState','Handle','HandleCount','InstallDate',
-        'KernelModeTime','MaximumWorkingSetSize','MinimumWorkingSetSize','Name','OSCreationClassName',
-        'OSName','OtherOperationCount','OtherTransferCount','PageFaults','PageFileUsage',
-        'ParentProcessId','PeakPageFileUsage','PeakVirtualSize','PeakWorkingSetSize','Priority',
-        'PrivatePageCount','ProcessId','QuotaNonPagedPoolUsage','QuotaPagedPoolUsage',
-        'QuotaPeakNonPagedPoolUsage','QuotaPeakPagedPoolUsage','ReadOperationCount','ReadTransferCount','SessionId',
-        'Status','TerminationDate','ThreadCount','UserModeTime','VirtualSize','WindowsVersion',
-        'WorkingSetSize','WriteOperationCount','WriteTransferCount'
-
-
-        Win32_ProcessStartTrace -Property *
-        'ParentProcessID','ProcessID','ProcessName','SECURITY_DESCRIPTOR','SessionID','Sid',
-        'TIME_CREATED'
+                }
+            }
+            return false;
+        }
 
 
-        Win32_ThreadStartTrace -Property *
-        'ProcessID','SECURITY_DESCRIPTOR','StackBase','StackLimit','StartAddr','ThreadID',
-        'TIME_CREATED','UserStackBase','UserStackLimit','WaitMode','Win32StartAddr'
+        public static bool TerminateProcessWMI(int? pid) {
+            if (pid is not null) {
+                try {
+                    string query = $"SELECT * FROM Win32_Process WHERE ProcessId = {pid}";
+                    ManagementObjectSearcher searcher = new ManagementObjectSearcher(query);
+                    ManagementObjectCollection processes = searcher.Get();
+                    foreach (ManagementObject process in processes) {
+                        uint returnValue = (uint)process.InvokeMethod("Terminate", null);
 
-        Win32_Thread -Property *
+                        if (returnValue == 0)
+                            return true;
+                    }
 
-        'Caption','CreationClassName','CSCreationClassName','CSName','Description',
-        'ElapsedTime','ExecutionState','Handle','InstallDate','KernelModeTime','Name','OSCreationClassName',
-        'OSName','Priority','PriorityBase','ProcessCreationClassName','ProcessHandle','StartAddress',
-        'Status','ThreadState','ThreadWaitReason','UserModeTime'
-        */
+                    if (processes.Count == 0) {
+                        return true;
+                    }
+                } catch (Exception ex) { }
+            }
+            return false;
+        }
+        
+        public static bool TerminateProcessWMI(string? name) {
+            if (name is not null) {
+                try {
+                    string query = $"SELECT * FROM Win32_Process WHERE ProcessName = {name}";
+                    ManagementObjectSearcher searcher = new ManagementObjectSearcher(query);
+                    ManagementObjectCollection processes = searcher.Get();
+                    foreach (ManagementObject process in processes) {
+                        uint returnValue = (uint)process.InvokeMethod("Terminate", null);
 
-        //public static ManagementEventWatcher GetEventWatcher(string? query = null)
-        //{
-        //    var wmiQuery = query is not null ? query : IsCurrentProcessElevated() ?
-        //            "SELECT ProcessID, ProcessName FROM Win32_ProcessStartTrace" : 
-        //            $"SELECT ExecutablePath, ProcessId FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process' AND Name LIKE '%Shipping%'";
-        //    var watcher = new ManagementEventWatcher(wmiQuery);
+                        if (returnValue == 0)
+                            return true;
+                    }
 
-        //    return watcher;
-        //}
-
-
+                    if (processes.Count == 0) {
+                        return true;
+                    }
+                } catch (Exception ex) { }
+            }
+            return false;
+        }
 
     }
 
-    // These are only really relevant to Unreal Engine and UEVR but could easily be adapted
-    public static class WindowUtils
-    {
+    // Delete locked files once they become unlocked
+    public static class CleanupScheduler {
+        public static async Task DeleteWhenUnlockedAsync(string path, CancellationToken token = default, Process? proc = null) {
+            if (proc is not null) {
+                await proc.WaitForExitAsync();
+            }
+            if (!File.Exists(path) && !Directory.Exists(path)) return;
+
+            while (true) {
+                token.ThrowIfCancellationRequested();
+
+                var lockers = FileLockInspector.GetLockingProcesses(path);
+
+                if (lockers.Count == 0) {
+                    try {
+                        if (Directory.Exists(path)) Directory.Delete(path);
+                        else if (File.Exists(path)) File.Delete(path);
+                        return;
+                    } catch (IOException) {
+                    } catch (UnauthorizedAccessException) {
+                        if (Application.Current.MainWindow.Visibility == Visibility.Visible)
+                            MessageBox.Show(Application.Current.MainWindow, $"Failed to delete {path}", "Warning");
+                    }
+                }
+
+                if (lockers.Count > 0) {
+                    var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    int remaining = lockers.Count;
+
+                    void OnExit(object? s, EventArgs e) {
+                        if (Interlocked.Decrement(ref remaining) == 0)
+                            tcs.TrySetResult(true);
+                    }
+
+                    var hooked = new List<Process>();
+                    try {
+                        foreach (var p in lockers.DistinctBy(p => p.Id)) {
+                            try {
+                                if (p.HasExited) continue;
+                                p.EnableRaisingEvents = true;
+                                p.Exited += OnExit;
+                                hooked.Add(p);
+                            } catch { }
+                        }
+
+                        if (hooked.Count == 0) {
+                            // nothing to wait on, back off a bit
+                            await Task.Delay(500, token);
+                        } else {
+                            await Task.WhenAny(tcs.Task, Task.Delay(10000, token));
+                        }
+                    } finally {
+                        foreach (var p in hooked) {
+                            try { p.Exited -= OnExit; } catch { }
+                        }
+                    }
+                }
+
+                await Task.Delay(250, token);
+            }
+        }
+    }
+
+
+    public static class FileLockInspector {
+        private const int RmRebootReasonNone = 0;
+
+        private enum RM_APP_TYPE {
+            RmUnknownApp = 0,
+            RmMainWindow = 1,
+            RmOtherWindow = 2,
+            RmService = 3,
+            RmExplorer = 4,
+            RmConsole = 5,
+            RmCritical = 1000
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RM_UNIQUE_PROCESS {
+            public int dwProcessId;
+            public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct RM_PROCESS_INFO {
+            public RM_UNIQUE_PROCESS Process;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+            public string strAppName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+            public string strServiceShortName;
+            public RM_APP_TYPE ApplicationType;
+            public uint AppStatus;
+            public uint TSSessionId;
+            [MarshalAs(UnmanagedType.Bool)]
+            public bool bRestartable;
+        }
+
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        private static extern int RmStartSession(
+            out uint pSessionHandle,
+            int dwSessionFlags,
+            string strSessionKey);
+
+        [DllImport("rstrtmgr.dll")]
+        private static extern int RmEndSession(uint pSessionHandle);
+
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        private static extern int RmRegisterResources(
+            uint pSessionHandle,
+            uint nFiles,
+            string [] rgsFilenames,
+            uint nApplications,
+            [In] RM_UNIQUE_PROCESS [] rgApplications,
+            uint nServices,
+            string [] rgsServiceNames);
+
+        [DllImport("rstrtmgr.dll")]
+        private static extern int RmGetList(
+            uint dwSessionHandle,
+            out uint pnProcInfoNeeded,
+            ref uint pnProcInfo,
+            [In, Out] RM_PROCESS_INFO [] rgAffectedApps,
+            out uint lpdwRebootReasons);
+
+        public static List<Process> GetLockingProcesses(string path) {
+            var result = new List<Process>();
+            uint handle;
+            string key = Guid.NewGuid().ToString();
+            int res = RmStartSession(out handle, 0, key);
+            if (res != 0) return result;
+
+            try {
+                string [] resources = { path };
+                res = RmRegisterResources(handle, (uint)resources.Length, resources, 0, null, 0, null);
+                if (res != 0) return result;
+
+                uint needed = 0;
+                uint count = 0;
+                uint reboot;
+                res = RmGetList(handle, out needed, ref count, null, out reboot);
+                if (res == 234) // ERROR_MORE_DATA
+                {
+                    var infos = new RM_PROCESS_INFO [needed];
+                    count = needed;
+                    res = RmGetList(handle, out needed, ref count, infos, out reboot);
+                    if (res == 0) {
+                        for (int i = 0; i < count; i++) {
+                            try {
+                                var pid = infos [i].Process.dwProcessId;
+                                var p = Process.GetProcessById(pid);
+                                result.Add(p);
+                            } catch { }
+                        }
+                    }
+                }
+            } finally {
+                RmEndSession(handle);
+            }
+
+            return result;
+        }
+    }
+
+    // Mostly UE related
+    public static class WindowUtils {
+        #region native
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr GetParent(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern uint GetWindowTextLengthA(IntPtr hWnd);
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool BringWindowToTop(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern IntPtr GetWindowTextA(IntPtr hWnd, out string? lpString, uint nMaxCount);
+
         [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         public static extern IntPtr FindWindow(string? WindowClass, string? WindowName);
 
 
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern IntPtr FindWindowEx(IntPtr hWndParent, IntPtr hWndChildAfter, string? WindowClass, string? WindowName);
+        [DllImport("user32.dll")]
+        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        public static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern bool RedrawWindow(IntPtr hWnd, IntPtr lprcUpdate, IntPtr hrgnUpdate, uint flags);
+
+        [DllImport("user32.dll")]
+        public static extern bool UpdateWindow(IntPtr hWnd);
+
         delegate IntPtr WndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-        struct WNDCLASS
-        {
+        struct WNDCLASS {
             public uint style;
             public IntPtr lpfnWndProc;
             public int cbClsExtra;
@@ -708,7 +1068,6 @@ namespace Utils
         // Delegate for the EnumWindows callback function
         public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
-
         [DllImport("user32.dll")]
         public static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
 
@@ -716,24 +1075,39 @@ namespace Utils
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
-
         [DllImport("user32.dll")]
         public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-       
-        
-        public static List<IntPtr> EnumerateUnrealWindows()
-        {
+
+        public delegate void WinEventProc(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
+
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc, WinEventProc lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
+
+        [DllImport("user32.dll")]
+        public static extern bool UnhookWinEvent(IntPtr hWinEventHook);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr SetWindowsHookEx(int idHook, IntPtr lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll")]
+        public static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool PostThreadMessage(uint idThread, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+        #endregion
+        public static List<IntPtr> EnumerateUnrealWindows() {
             List<IntPtr> windows = new List<IntPtr>();
 
-            EnumWindows((hWnd, lParam) =>
-            {
+            EnumWindows((hWnd, lParam) => {
                 const int MAX_CLASS_NAME_LENGTH = 256;
                 StringBuilder classNameBuilder = new StringBuilder(MAX_CLASS_NAME_LENGTH);
 
-                if (GetClassName(hWnd, classNameBuilder, MAX_CLASS_NAME_LENGTH) > 0)
-                {
-                    if (classNameBuilder.ToString() == "UnrealWindow")
-                    {
+                if (GetClassName(hWnd, classNameBuilder, MAX_CLASS_NAME_LENGTH) > 0) {
+                    if (classNameBuilder.ToString() == "UnrealWindow") {
                         windows.Add(hWnd);
                     }
                 }
@@ -743,17 +1117,34 @@ namespace Utils
             return windows;
         }
 
-        public static bool CheckProcessForUnrealWindow(Process p)
-        {
+
+        public static List<Process> GetAllUnrealProcesses() {
+            List<IntPtr> windows = EnumerateUnrealWindows();
+            List<Process> processes = new() { };
+            if (windows.Count > 0) {
+                foreach (var window in windows) {
+                    try {
+                        _ = GetWindowThreadProcessId(window, out uint processId);
+                        Process? p = Process.GetProcessById((int)processId);
+                        if (p is not null) {
+                            processes.Add(p);
+                        }
+                    } catch { }
+                }
+            }
+            return processes;
+        }
+
+        public static bool CheckProcessForUnrealWindow(Process p) {
+            if (p is null) return false;
             return CheckProcessForUnrealWindow((uint)p.Id);
         }
 
-        public static bool CheckProcessForUnrealWindow(uint pId)
-        {
+        public static bool CheckProcessForUnrealWindow(uint pId) {
+            // Code Vein 1 and 2 are the only Unreal games without UnrealWindows            
             // FindWindow searches all windows and processes so if this gets nothing there is no unreal process running 
             IntPtr unrealWindow = FindWindow("UnrealWindow", null);
-            if (unrealWindow == IntPtr.Zero)
-            {
+            if (unrealWindow == IntPtr.Zero) {
                 return false;
             }
 
@@ -763,12 +1154,9 @@ namespace Utils
                 return true;
 
             // We found an unreal window that didn't belong to our process so we now have to scan all windows
-            // would be neat if findwindow could do repeated calls with an exclusion or something but no that would be too easy
-            try
-            {
+            try {
                 var windows = EnumerateUnrealWindows();
-                foreach (var wnd in windows)
-                {
+                foreach (var wnd in windows) {
                     // skip the original window
                     if (wnd == unrealWindow) continue;
 
@@ -780,51 +1168,42 @@ namespace Utils
                     else
                         continue;
                 }
-            }
-            catch (Exception)
-            {
+            } catch (Exception) {
                 return false;
             }
             return false;
         }
 
-
-        public static uint FindUnrealWindow()
-        {
+        public static uint FindUnrealWindow() {
             IntPtr unrealWindow = FindWindow("UnrealWindow", null);
-            if (unrealWindow == IntPtr.Zero)
-            {
+            if (unrealWindow == IntPtr.Zero) {
                 return 0;
             }
-            var excludedTitles = new string[] { "launcher", "crashreport", "ue4editor", "unrealeditor", "livecoding", "unrealinsights", "unrealswitchboard", "unrealfrontend", "livelinkhub", "zendashboard" };
+            var excludedTitles = new string [] { "launcher", "epicgameslauncher", "crashreportclient", "ue4editor", "unrealeditor", "livecoding", "unrealinsights", "unrealswitchboard", "unrealfrontend", "livelinkhub", "zendashboard" };
             // Get the process id for the initially found window
             var tid = GetWindowThreadProcessId(unrealWindow, out uint processId);
 
-            try
-            {
+            try {
                 // Attempt to get the process name for the initial window
                 string procName = "";
-                try
-                {
+                try {
                     var proc = Process.GetProcessById((int)processId);
                     procName = proc?.MainModule?.FileName?.ToLowerInvariant() ?? "";
-                }
-                catch
-                {
-                    procName = "";
+                } catch {
+                    Utils.ProcessManagement.GetExecutablePath((int)processId, out string? executable_path);
+                    if (executable_path is not null) {
+                        procName = Path.GetFileName(executable_path).ToLowerInvariant();
+                    }
                 }
                 bool excluded = false;
                 // If the initial window belongs to an excluded process, look for other UnrealWindow class windows
-                foreach (var proc in excludedTitles)
-                {
+                foreach (var proc in excludedTitles) {
                     if (procName.Contains(proc)) { excluded = true; break; }
                 }
-                if (excluded)
-                {
+                if (excluded) {
                     var windows = EnumerateUnrealWindows();
 
-                    foreach (var wnd in windows)
-                    {
+                    foreach (var wnd in windows) {
                         // skip the original window
                         if (wnd == unrealWindow) continue;
 
@@ -833,40 +1212,32 @@ namespace Utils
 
                         if (otherPid == 0 || otherPid == processId) continue;
 
-                        try
-                        {
+                        try {
                             var otherProc = Process.GetProcessById((int)otherPid);
                             var otherName = otherProc?.MainModule?.FileName?.ToLowerInvariant() ?? "";
                             bool other_excluded = false;
                             // return the first UnrealWindow that does NOT belong to an excluded process
-                            foreach (var proc in excludedTitles)
-                            {
+                            foreach (var proc in excludedTitles) {
                                 if (otherName.Contains(proc)) { other_excluded = true; break; }
                             }
-                            if (!other_excluded)
-                            {
+                            if (!other_excluded) {
                                 return otherPid;
                             }
-                        }
-                        catch
-                        {
+                        } catch {
                             // ignore processes we cannot inspect and continue searching
                             continue;
                         }
                     }
-                }
-                else
-                {
+                } else {
                     return processId;
                 }
-            }
-            catch (Exception)
-            {
+            } catch (Exception) {
                 // fall back to returning the originally discovered process id
             }
             return 0;
         }
     }
 }
+
 
 
